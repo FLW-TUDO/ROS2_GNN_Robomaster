@@ -49,3 +49,12 @@ rosbag2*
 
 # If you DO want any of the above, remove the pattern later.
 .bashrc
+
+#for macOS
+.DS_Store
+
+notion/
+src/nav_files.zip
+src/m-explore-ros2.zip
+src/nav_files.zip
+src/m-explore-ros2.zip
