@@ -16,6 +16,13 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # IDE / OS
 .vscode/
@@ -25,6 +32,7 @@ venv/
 # Datasets, logs, and heavy exports
 *.csv
 *.db3
+*.mcap
 *.bag
 *.bag.active
 *.bag2
@@ -35,6 +43,8 @@ rosbag2*
 *.npz
 *.npy
 *.onnx
+*.log
+full_log.txt
 
 # Images and maps (keep maps YAML, ignore big binaries by default)
 *.png
@@ -46,6 +56,11 @@ rosbag2*
 .~lock.*
 *.swp
 *.swo
+*~
+*.bak
+*.orig
+*.rej
+backups/
 
 # If you DO want any of the above, remove the pattern later.
 .bashrc

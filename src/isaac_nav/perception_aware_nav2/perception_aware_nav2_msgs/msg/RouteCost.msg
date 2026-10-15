@@ -7,6 +7,7 @@ float64 obs_term
 float64 comms_term
 float64 safety_term
 float64 energy_term
+float64 lambda_time
 float64 lambda_obs
 float64 lambda_comms
 float64 lambda_safety
