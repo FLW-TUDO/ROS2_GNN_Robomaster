@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""
-route_cost_puc_pynode  —  Option 2, Phase 3 (Day 1).
+"""Assess each robot's current global plan and publish per-plan PUC.
 
-Subscribes to the Nav2 global plan and scores it with route cost J(pi) and PUC.
-Day 1: ETA (time) + Energy terms real; observability/comms/safety = 0.0 stubs.
-
-All inputs are in the `map` frame (plan, polygons, costmap) — no TF needed.
-Topic names are relative so PushRosNamespace('rm03') resolves them under /rm03.
+Robot inputs resolve inside the launch namespace. PUC uses the final thesis
+component definitions and weights. Executed-route results use the existing
+thesis analysis workflow.
 """
 import math
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from nav_msgs.msg import Path, OccupancyGrid
 from sensor_msgs.msg import BatteryState
 from gnn_interfaces.msg import TrackedPolygon
 from perception_aware_nav2_msgs.msg import LinkStats, RouteCost, RoutePUC, RoutePUCComponents
 
+from route_cost_puc_pynode.runtime_contract import robot_identity, robot_topic
+from route_cost_puc_pynode.thesis_scoring import (
+    time_confidence, energy_confidence, fuse_puc, ROUTE_COEFFICIENTS,
+    TIME_BUDGET_MULTIPLE, ENERGY_ALPHA_WH_PER_M, ENERGY_BETA_WH_PER_TURN,
+)
 from route_cost_puc_pynode.path_sampler import resample_path
 from route_cost_puc_pynode.polygon_tracker import PolygonTracker
 
@@ -30,19 +32,15 @@ def sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def norm_cdf(x):
-    # P(Z <= x) without scipy
-    return 0.5 * math.erfc(-x / math.sqrt(2.0))
-
 
 class RouteCostPucNode(Node):
     def __init__(self):
         super().__init__('route_cost_puc')
 
         # ---------------- parameters ----------------
-        self.declare_parameter('robot_id', 'rm03')
+        self.declare_parameter('robot_id', '')
         self.declare_parameter('trial_id', '')
-        self.declare_parameter('plan_topic', '/rm03/plan')         # absolute, NavfnPlanner output
+        self.declare_parameter('plan_topic', 'plan')               # relative to the robot namespace
         self.declare_parameter('polygons_topic', '/tracked_polygons')
         self.declare_parameter('link_stats_topic', 'comms/link_stats')
         self.declare_parameter('battery_topic', 'battery_state')
@@ -52,7 +50,8 @@ class RouteCostPucNode(Node):
         self.declare_parameter('v_ref_mps', 0.6)                   # = FollowPath.max_vel_x
         self.declare_parameter('k_slowdown', 0.01)
         self.declare_parameter('resample_ds_m', 0.10)              # 2x costmap res
-        self.declare_parameter('t_sla_s', 30.0)
+        self.declare_parameter('time_budget_multiple', TIME_BUDGET_MULTIPLE)
+        self.declare_parameter('tracker_warmup_s', 20.0)
         self.declare_parameter('sigma_T_per_meter', 0.05)
         self.declare_parameter('sigma_T_per_ms_jitter', 0.01)
 
@@ -81,33 +80,36 @@ class RouteCostPucNode(Node):
 
         # energy
         self.declare_parameter('use_battery_topic', True)
-        self.declare_parameter('energy_alpha_per_m', 1.0)
-        self.declare_parameter('energy_beta_per_turn', 0.5)
-        self.declare_parameter('battery_capacity_wh', 0.0)         # 0 => energy observational
-        self.declare_parameter('energy_reserve_wh', 2.0)
+        self.declare_parameter('energy_alpha_per_m', ENERGY_ALPHA_WH_PER_M)
+        self.declare_parameter('energy_beta_per_turn', ENERGY_BETA_WH_PER_TURN)
+        self.declare_parameter('battery_capacity_wh', 25.92)
+        self.declare_parameter('energy_reserve_wh', 5.184000000000001)
         self.declare_parameter('energy_scale_wh', 5.0)
         self.declare_parameter('turn_threshold_rad', 0.20)         # yaw step counted as a "turn"
 
         # J(pi) weights
-        self.declare_parameter('lambda_obs', 1.0)
-        self.declare_parameter('lambda_comms', 1.0)
-        self.declare_parameter('lambda_safety', 2.0)
-        self.declare_parameter('lambda_energy', 0.0)
+        self.declare_parameter('lambda_time', ROUTE_COEFFICIENTS['time'])
+        self.declare_parameter('lambda_obs', ROUTE_COEFFICIENTS['obs'])
+        self.declare_parameter('lambda_comms', ROUTE_COEFFICIENTS['comms'])
+        self.declare_parameter('lambda_safety', ROUTE_COEFFICIENTS['safety'])
+        self.declare_parameter('lambda_energy', ROUTE_COEFFICIENTS['energy'])
 
         # PUC fusion weights
         self.declare_parameter('w_t', 1.0)
         self.declare_parameter('w_o', 1.0)
         self.declare_parameter('w_c', 1.0)
         self.declare_parameter('w_s', 2.0)
-        self.declare_parameter('w_e', 0.5)             # 0 until battery_capacity_wh set
+        self.declare_parameter('w_e', 0.5)
 
         gp = self.get_parameter
-        self.robot_id = gp('robot_id').value
+        self.robot_id = robot_identity(self.get_namespace(), gp('robot_id').value)
         self.trial_id = gp('trial_id').value
         self.v_ref = float(gp('v_ref_mps').value)
         self.k_slowdown = float(gp('k_slowdown').value)
         self.ds = float(gp('resample_ds_m').value)
-        self.t_sla = float(gp('t_sla_s').value)
+        self.time_budget_multiple = float(gp('time_budget_multiple').value)
+        self.tracker_warmup_s = float(gp('tracker_warmup_s').value)
+        self.lam_t = float(gp('lambda_time').value)
         self.sigT_L = float(gp('sigma_T_per_meter').value)
         self.sigT_j = float(gp('sigma_T_per_ms_jitter').value)
         self.tube_radius_m = float(gp('tube_radius_m').value)
@@ -144,7 +146,9 @@ class RouteCostPucNode(Node):
         self.costmap = None
         self.jitter_ms = None
         self.rsrp_dbm = None
-        self.soc = 1.0              # latest battery percentage [0,1]
+        self.soc = None
+        self._has_polygon_input = False
+        self._started_sec = self.get_clock().now().nanoseconds * 1e-9
         self.poly_tracker = PolygonTracker(
             match_radius_m=self.match_radius_m,
             decay_time_s=self.decay_time_s,
@@ -155,19 +159,20 @@ class RouteCostPucNode(Node):
         # ---------------- QoS ----------------
         # Costmap is latched (transient_local) in Nav2; match it.        
         qos_map = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                             history=HistoryPolicy.KEEP_LAST)
+                             history=HistoryPolicy.KEEP_LAST,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
         # ---------------- subs ----------------
-        self.create_subscription(Path, gp('plan_topic').value, self.on_plan, 10)
-        self.create_subscription(OccupancyGrid, gp('costmap_topic').value,
+        self.create_subscription(Path, robot_topic(gp('plan_topic').value, self.get_namespace()), self.on_plan, 10)
+        self.create_subscription(OccupancyGrid, robot_topic(gp('costmap_topic').value, self.get_namespace()),
                                  self.on_costmap, qos_map)
-        self.create_subscription(LinkStats, gp('link_stats_topic').value,
+        self.create_subscription(LinkStats, robot_topic(gp('link_stats_topic').value, self.get_namespace()),
                                  self.on_link, 10)
         self.create_subscription(TrackedPolygon, gp('polygons_topic').value,
                                  self.on_polygon, 10)
         if self.use_batt:
-            self.create_subscription(BatteryState, gp('battery_topic').value,
+            self.create_subscription(BatteryState, robot_topic(gp('battery_topic').value, self.get_namespace()),
                                      self.on_battery, 10)
             
         # ---------------- pubs ----------------
@@ -183,9 +188,14 @@ class RouteCostPucNode(Node):
 
 
     # ---------- input callbacks ----------
-    def on_costmap(self, msg):  self.costmap = msg
+    def on_costmap(self, msg):
+        if msg.header.frame_id != 'map':
+            return
+        self.costmap = msg
     def on_link(self, msg):     
-        self.jitter_ms = float(msg.jitter_ms) 
+        if msg.robot_id and msg.robot_id != self.robot_id:
+            return
+        self.jitter_ms = float(msg.jitter_ms)
         self.rsrp_dbm = float(msg.rsrp_dbm)
     def on_battery(self, msg):
         # percentage is the trustable SoC field on this driver (see Lf3_Lf4 §2.3)
@@ -197,6 +207,7 @@ class RouteCostPucNode(Node):
             return
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         self.poly_tracker.update(msg, now_sec)
+        self._has_polygon_input = True
        
 
     # ---------- costmap sampling ----------
@@ -298,12 +309,16 @@ class RouteCostPucNode(Node):
         if len(msg.poses) < 2:      # can't score trivial paths (also guards against empty plans on startup)
             return
         
+        if msg.header.frame_id != 'map':
+            return
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         self.poly_tracker.prune(now_sec)
 
         # Plan is in map (inner pose headers are empty — do NOT trust them).
         xs = np.array([p.pose.position.x for p in msg.poses])
         ys = np.array([p.pose.position.y for p in msg.poses])
+        if not np.isfinite(xs).all() or not np.isfinite(ys).all():
+            return
         s, rx, ry, ryaw = resample_path(xs, ys, self.ds)
         if len(s) < 2:
             return
@@ -321,26 +336,21 @@ class RouteCostPucNode(Node):
             v = max(1e-3, self.v_ref * math.exp(-self.k_slowdown * c))
             mu_T += ds_i / v
         time_term = mu_T
-        jitter_for_sigma = self.jitter_ms if self.jitter_ms is not None else 0.0
         
-        sigma_T = max(1e-3, self.sigT_L * path_len + self.sigT_j * jitter_for_sigma)
-        p_t = norm_cdf((self.t_sla - mu_T) / sigma_T)   # P(T <= SLA)
+        p_t = time_confidence(path_len, mu_T, self.jitter_ms, self.time_budget_multiple,
+                              self.v_ref, self.sigT_L, self.sigT_j)
 
         # ----- Energy term (Step F) -----
         dyaw = np.abs(np.diff(ryaw))
         dyaw = np.minimum(dyaw, 2 * math.pi - dyaw)     # wrap
         n_turns = int(np.sum(dyaw > self.turn_thr))
-        e_path = self.e_alpha * path_len + self.e_beta * n_turns   # Wh
-        energy_term = e_path
+        energy_term = path_len + 0.5 * n_turns  # Geometric effort proxy for route cost.
+        p_e = energy_confidence(path_len, n_turns, self.soc,
+                                alpha=self.e_alpha, beta=self.e_beta,
+                                capacity_wh=self.batt_cap, reserve_wh=self.e_reserve,
+                                scale_wh=self.e_scale)
 
-        if self.batt_cap > 0.0:
-            e_remaining_now = self.soc * self.batt_cap
-            e_remaining_goal = e_remaining_now - e_path
-            p_e = sigmoid((e_remaining_goal - self.e_reserve) / self.e_scale)
-        else:
-            p_e = 1.0   # observational mode: energy doesn't gate
-
-        # -----new  obs/comms/safety stubs  -----
+        # ----- observability, communication and safety -----
         obs_term, p_o = self.compute_obs_term(rx, ry, seg_ds)
         comms_term, p_c = self.compute_comms_term(path_len)
         safety_term, p_s, min_ttc_s = self.compute_safety_term(rx, ry, ryaw, seg_ds, now_sec)
@@ -356,19 +366,22 @@ class RouteCostPucNode(Node):
         rsrp_for_msg = self.rsrp_dbm if self.rsrp_dbm is not None else float('nan')
         jitter_for_msg = self.jitter_ms if self.jitter_ms is not None else float('nan')
 
-        j_total = (time_term
+        j_total = (self.lam_t * time_term
                    + self.lam_o * obs_term
                    + self.lam_c * comms_term
                    + self.lam_s * safety_term
                    + self.lam_e * energy_term)
 
         w = self.w
-        wsum = sum(w.values())
-        comps = {'t': p_t, 'o': p_o, 'c': p_c, 's': p_s, 'e': p_e}
-        eps = 1e-6
-        log_puc = sum(w[k] * math.log(max(eps, comps[k])) for k in comps) / max(eps, wsum)
-        puc = math.exp(log_puc)
-
+        if self.costmap is None:
+            p_t = math.nan
+        if self.rsrp_dbm is None or self.jitter_ms is None:
+            p_c = math.nan
+        if not self._has_polygon_input or now_sec-self._started_sec < self.tracker_warmup_s:
+            p_o = p_s = math.nan
+        puc = fuse_puc({'t': p_t, 'o': p_o, 'c': p_c, 's': p_s, 'e': p_e}, w)
+        if not all(math.isfinite(p) for p in (p_t, p_o, p_c, p_s)):
+            j_total = math.nan
 
         # publish
         now = self.get_clock().now().to_msg()
@@ -383,13 +396,14 @@ class RouteCostPucNode(Node):
         rc.comms_term = comms_term
         rc.safety_term = safety_term
         rc.energy_term = energy_term
+        rc.lambda_time = self.lam_t
         rc.lambda_obs = self.lam_o
         rc.lambda_comms = self.lam_c
         rc.lambda_safety = self.lam_s
         rc.lambda_energy = self.lam_e
         rc.path_length_m = path_len
         rc.nominal_speed_mps = self.v_ref
-        rc.soc_fraction = self.soc
+        rc.soc_fraction = self.soc if self.soc is not None else math.nan
         rc.n_obstacles = n_obstacles
         rc.nearest_obstacle_m = nearest_obstacle_m
         rc.rsrp_dbm = rsrp_for_msg
@@ -413,19 +427,11 @@ class RouteCostPucNode(Node):
         self.pub_puc.publish(pm)
 
         self.get_logger().info(
-    f"\033[32mJ={j_total:.2f} (T={time_term:.2f} O={obs_term:.2f} C={comms_term:.2f} "
+    f"\033[32mJ_plan={j_total:.2f} (T={time_term:.2f} O={obs_term:.2f} C={comms_term:.2f} "
     f"S={safety_term:.2f} E={energy_term:.2f}) L={path_len:.2f}m  "
     f"PUC={puc:.3f} (pt={p_t:.2f} po={p_o:.2f} pc={p_c:.2f} ps={p_s:.2f} pe={p_e:.2f})\033[0m",
     throttle_duration_sec=2.0)
 
-
-        # ----- PUC (geometric mean) -----
-        w = self.w
-        wsum = sum(w.values())
-        comps = {'t': p_t, 'o': p_o, 'c': p_c, 's': p_s, 'e': p_e}
-        eps = 1e-6
-        log_puc = sum(w[k] * math.log(max(eps, comps[k])) for k in comps) / max(eps, wsum)
-        puc = math.exp(log_puc)
 
 
 def main(args=None):

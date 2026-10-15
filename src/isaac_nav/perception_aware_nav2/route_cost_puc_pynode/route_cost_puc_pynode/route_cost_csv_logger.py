@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""
-Subscribes to /rm03/route_cost, /rm03/route_puc, /rm03/route_puc_components
-and writes one CSV row per planner cycle to ~/runs/<run_id>.csv.
+"""Write one CSV row for each complete, matching planner-cycle output.
 
-Joins rows by approximate header.stamp; latest seen component values are used
-for each route_cost row (PUC publishes alongside route_cost from the same node
-so they almost always arrive together).
+Subscriptions are relative to the launch namespace. Cost, PUC and component
+messages are joined by exact timestamp, robot identifier and trial identifier.
 """
 import csv
 import os
-import socket
 from datetime import datetime
 from threading import Lock
+
+from route_cost_puc_pynode.cycle_join import CycleJoin
+from route_cost_puc_pynode.runtime_contract import robot_identity
 
 import rclpy
 from rclpy.node import Node
@@ -23,7 +22,7 @@ class RouteCostCsvLogger(Node):
         'wall_iso', 'sec', 'nanosec', 'robot_id', 'trial_id',
         'j_total', 'time_term', 'obs_term', 'comms_term', 'safety_term', 'energy_term',
         'path_length_m', 'nominal_speed_mps', 'soc_fraction',
-        'lambda_obs', 'lambda_comms', 'lambda_safety', 'lambda_energy',
+        'lambda_time', 'lambda_obs', 'lambda_comms', 'lambda_safety', 'lambda_energy',
         'puc', 'p_t', 'p_o', 'p_c', 'p_s', 'p_e',
         'w_t', 'w_o', 'w_c', 'w_s', 'w_e',
         'n_obstacles', 'nearest_obstacle_m', 'rsrp_dbm', 'jitter_ms', 'min_ttc_s',
@@ -31,46 +30,51 @@ class RouteCostCsvLogger(Node):
 
     def __init__(self):
         super().__init__('route_cost_csv_logger')
-        hostname = socket.gethostname().replace('-', '_')
-        namespace = f'/{hostname}'
-        super().__init__('fake_rsrp_node', namespace=namespace)
         self.declare_parameter('run_id', 'default_run')
-        #self.declare_parameter('output_dir', os.path.expanduser('~/runs'))
-        self.declare_parameter('output_dir', '/workspaces/isaac_ros-dev/dk_ros2_bags')
+        self.declare_parameter('robot_id', '')
+        robot = robot_identity(self.get_namespace(), self.get_parameter('robot_id').value)
+        self.declare_parameter('output_dir', os.path.expanduser('~/runs'))
+        self.declare_parameter('max_pending_cycles', 200)
         self.run_id = self.get_parameter('run_id').value
         outdir = self.get_parameter('output_dir').value
         os.makedirs(outdir, exist_ok=True)
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.path = os.path.join(outdir, f'{self.run_id}_{ts}.csv')
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        self.path = os.path.join(outdir, f'{robot}_{self.run_id}_{ts}.csv')
 
         self._lock = Lock()
-        self._last_puc = None
-        self._last_comp = None
+        self._cycles = CycleJoin(int(self.get_parameter('max_pending_cycles').value))
 
         self._f = open(self.path, 'w', newline='')
         self._w = csv.writer(self._f)
         self._w.writerow(self.HEADER)
         self._f.flush()
 
-        self.create_subscription(RouteCost, '{namespace}/route_cost', self.on_cost, 20)
-        self.create_subscription(RoutePUC, '{namespace}/route_puc', self.on_puc, 20)
+        self.create_subscription(RouteCost, 'route_cost', self.on_cost, 20)
+        self.create_subscription(RoutePUC, 'route_puc', self.on_puc, 20)
         self.create_subscription(RoutePUCComponents,
-                                 '{namespace}/route_puc_components', self.on_comp, 20)
+                                 'route_puc_components', self.on_comp, 20)
         self.get_logger().info(f'\033[92mCSV logging to {self.path}\033[0m')
 
 
     def on_puc(self, msg):
-        with self._lock:
-            self._last_puc = msg
+        self._receive('puc', msg)
 
     def on_comp(self, msg):
-        with self._lock:
-            self._last_comp = msg
+        self._receive('components', msg)
 
     def on_cost(self, msg):
+        self._receive('cost', msg)
+
+    def _receive(self, kind, msg):
         with self._lock:
-            puc = self._last_puc
-            comp = self._last_comp
+            dropped = self._cycles.dropped
+            joined = self._cycles.add(kind, msg)
+            if self._cycles.dropped != dropped:
+                self.get_logger().warning('Discarded an incomplete planner cycle from the bounded queue')
+            if joined is not None:
+                self._write_row(*joined)
+
+    def _write_row(self, msg, puc, comp):
         wall_iso = datetime.now().isoformat()
         row = [
             wall_iso, msg.header.stamp.sec, msg.header.stamp.nanosec,
@@ -78,7 +82,7 @@ class RouteCostCsvLogger(Node):
             msg.j_total, msg.time_term, msg.obs_term, msg.comms_term,
             msg.safety_term, msg.energy_term,
             msg.path_length_m, msg.nominal_speed_mps, msg.soc_fraction,
-            msg.lambda_obs, msg.lambda_comms, msg.lambda_safety, msg.lambda_energy,
+            msg.lambda_time, msg.lambda_obs, msg.lambda_comms, msg.lambda_safety, msg.lambda_energy,
             puc.puc if puc else '', comp.p_t if comp else '',
             comp.p_o if comp else '', comp.p_c if comp else '',
             comp.p_s if comp else '', comp.p_e if comp else '',
@@ -93,6 +97,8 @@ class RouteCostCsvLogger(Node):
 
     def destroy_node(self):
         try:
+            if self._cycles.pending:
+                self.get_logger().warning(f'{len(self._cycles.pending)} incomplete planner cycles were not written')
             self._f.close()
         except Exception:
             pass

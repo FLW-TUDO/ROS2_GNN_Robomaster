@@ -1,0 +1,49 @@
+# Current-plan assessment and per-plan PUC: final thesis numerical definitions.
+# Robot inputs resolve under the launch namespace.
+/**:
+  ros__parameters:
+    plan_topic: plan
+    polygons_topic: /tracked_polygons
+    link_stats_topic: comms/link_stats
+    battery_topic: battery_state
+    costmap_topic: global_costmap/costmap
+    robot_id: ''
+    trial_id: ''
+    v_ref_mps: 0.6
+    k_slowdown: 0.01
+    resample_ds_m: 0.1
+    sigma_T_per_meter: 0.05
+    sigma_T_per_ms_jitter: 0.01
+    use_battery_topic: true
+    energy_alpha_per_m: 0.009803992713305888
+    energy_beta_per_turn: 0.003177606424396346
+    battery_capacity_wh: 25.92
+    energy_reserve_wh: 5.184000000000001
+    energy_scale_wh: 5.0
+    turn_threshold_rad: 0.2
+    tube_radius_m: 1.0
+    obs_a_uncertainty: 1.0
+    obs_b_fragility: 0.7
+    obs_decay_tau_m: 0.8
+    rsrp_min_dbm: -85.0
+    rsrp_scale_db: 10.0
+    jitter_max_ms: 30.0
+    jitter_scale_ms: 15.0
+    safety_horizon_s: 3.0
+    dynamic_labels:
+    - 2
+    - 4
+    safety_g_min_s: 1.0
+    safety_scale_s: 0.4
+    lambda_obs: 2.2120576740455227
+    lambda_comms: 1.0751520482905212
+    lambda_safety: 8.432645250901363
+    lambda_energy: 0.37028242098654696
+    w_t: 1.0
+    w_o: 1.0
+    w_c: 1.0
+    w_s: 2.0
+    w_e: 0.5
+    time_budget_multiple: 1.207356997594271
+    tracker_warmup_s: 20.0
+    lambda_time: 0.21000911811244674
